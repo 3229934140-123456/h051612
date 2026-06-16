@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Optional
 
 from .registry import Registry, Instance
+from .watcher import Watcher
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class MessageType(str, Enum):
     ACK = "ACK"
     SYNC = "SYNC"
     COMPOUND = "COMPOUND"
+    EVENT = "EVENT"
 
 
 @dataclass
@@ -35,6 +37,7 @@ class GossipMember:
     member_id: str
     host: str
     port: int
+    http_port: int = 0
     state: MemberState = MemberState.ALIVE
     incarnation: int = 0
     last_seen: float = field(default_factory=time.time)
@@ -49,6 +52,7 @@ class GossipMember:
             "member_id": self.member_id,
             "host": self.host,
             "port": self.port,
+            "http_port": self.http_port,
             "state": self.state.value,
             "incarnation": self.incarnation,
             "last_seen": self.last_seen,
@@ -85,8 +89,10 @@ class GossipProtocol:
         suspect_timeout: float = 15.0,
         sync_interval: float = 10.0,
         gossip_interval: float = 1.0,
+        watcher: Optional[Watcher] = None,
     ):
         self.registry = registry
+        self.watcher = watcher
         self.self_host = self_host
         self.self_port = self_port
         self.member_id = member_id or uuid.uuid4().hex[:12]
@@ -98,10 +104,14 @@ class GossipProtocol:
         self.sync_interval = sync_interval
         self.gossip_interval = gossip_interval
 
+        self._last_sync_time: dict[str, float] = {}
+        self._sync_error_count: dict[str, int] = {}
+
         self.self_member = GossipMember(
             member_id=self.member_id,
             host=self_host,
             port=protocol_port,
+            http_port=self_port,
             state=MemberState.ALIVE,
         )
 
@@ -137,16 +147,48 @@ class GossipProtocol:
     def get_all_members(self) -> list[GossipMember]:
         return list(self._members.values())
 
+    async def get_cluster_stats(self) -> dict:
+        all_instances = await self.registry.get_all_instances()
+        total_instances = sum(len(v) for v in all_instances.values())
+        total_services = len(all_instances)
+        alive_members = self.get_alive_members()
+        return {
+            "member_id": self.member_id,
+            "host": self.self_host,
+            "http_port": self.self_port,
+            "gossip_port": self.protocol_port,
+            "state": self.self_member.state.value,
+            "total_services": total_services,
+            "total_instances": total_instances,
+            "alive_members": len(alive_members),
+            "all_members": len(self._members),
+            "last_sync_times": self._last_sync_time,
+            "sync_error_count": self._sync_error_count,
+            "tombstones_count": len(self.registry.get_tombstones()),
+            "protection_enabled": self.registry._protection_enabled,
+            "subscriber_count": self.watcher.get_subscriber_count() if self.watcher else 0,
+        }
+
+    def propagate_event(self, event: dict):
+        msg = GossipMessage(
+            msg_type=MessageType.EVENT,
+            sender_id=self.member_id,
+            data=event,
+        )
+        self._transmission_queue.append(msg)
+
     async def join(self, host: str, port: int) -> bool:
         try:
             sync_data = await self._send_sync(host, port)
             if sync_data:
                 logger.info("Join successful, sync_data keys: %s", list(sync_data.keys()))
                 member_id = sync_data.get("sender_id", "")
+                http_port = sync_data.get("http_port", port)
                 member = GossipMember(
                     member_id=member_id,
                     host=host,
                     port=port,
+                    http_port=http_port,
                     state=MemberState.ALIVE,
                 )
                 if member_id and member_id != self.member_id:
@@ -384,7 +426,12 @@ class GossipProtocol:
                 others = [m for m in alive if m.member_id != self.member_id]
                 if others:
                     target = random.choice(others)
-                    await self._send_sync(target.host, target.port)
+                    response = await self._send_sync(target.host, target.port)
+                    if response:
+                        self._last_sync_time[target.member_id] = time.time()
+                        self._sync_error_count[target.member_id] = 0
+                    else:
+                        self._sync_error_count[target.member_id] = self._sync_error_count.get(target.member_id, 0) + 1
             except Exception as e:
                 logger.error("Sync loop error: %s", e)
             await asyncio.sleep(self.sync_interval)
@@ -466,6 +513,7 @@ class GossipProtocol:
                     "tombstones": full_state.get("tombstones", {}),
                     "members": {mid: m.to_dict() for mid, m in self._members.items()},
                     "sender_id": self.member_id,
+                    "http_port": self.self_port,
                 }
 
                 if self._udp_transport:
@@ -488,6 +536,21 @@ class GossipProtocol:
                         if not existing or existing.incarnation < updated.incarnation:
                             self._members[updated.member_id] = updated
                             await self._notify_member_change(updated, action or "UPDATE")
+
+            elif msg_type == MessageType.EVENT:
+                event_data = payload
+                if self.watcher:
+                    try:
+                        change_type = event_data.get("change_type")
+                        service_name = event_data.get("service_name")
+                        instance_data = event_data.get("instance")
+                        if change_type and service_name and instance_data:
+                            from .registry import Instance
+                            instance = Instance.from_dict(instance_data)
+                            await self.watcher.notify(service_name, instance, change_type)
+                            logger.debug("Received remote event %s for %s", change_type, service_name)
+                    except Exception as e:
+                        logger.error("Failed to process remote event: %s", e)
 
         except Exception as e:
             logger.error("Handle datagram error from %s: %s", addr, e)
@@ -540,6 +603,17 @@ class GossipProtocol:
             },
         )
         self._transmission_queue.append(msg)
+
+        event_msg = GossipMessage(
+            msg_type=MessageType.EVENT,
+            sender_id=self.member_id,
+            data={
+                "change_type": action,
+                "service_name": instance.service_name,
+                "instance": instance.to_dict(),
+            },
+        )
+        self._transmission_queue.append(event_msg)
 
 
 class _GossipProtocolHandler(asyncio.DatagramProtocol):

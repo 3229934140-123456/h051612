@@ -47,6 +47,7 @@ class DiscoveryServer:
                 self_host=host,
                 self_port=port,
                 protocol_port=gossip_port,
+                watcher=self.watcher,
             )
 
         self.registry.on_change(self._on_instance_change)
@@ -152,6 +153,7 @@ class DiscoveryServer:
             ("DELETE", "/deregister"): self._handle_deregister,
             ("PUT", "/renew"): self._handle_renew,
             ("GET", "/instances"): self._handle_get_instances,
+            ("GET", "/instances/query"): self._handle_query_instances,
             ("GET", "/services"): self._handle_get_services,
             ("GET", "/health"): self._handle_health_check,
             ("POST", "/subscribe"): self._handle_subscribe,
@@ -162,6 +164,7 @@ class DiscoveryServer:
             ("POST", "/gossip/join"): self._handle_gossip_join,
             ("GET", "/gossip/members"): self._handle_gossip_members,
             ("GET", "/protection"): self._handle_protection_status,
+            ("GET", "/cluster/status"): self._handle_cluster_status,
         }
 
         handler = routes.get((method, path))
@@ -259,7 +262,16 @@ class DiscoveryServer:
         stats["protection"] = self.protection.get_stats()
         stats["subscribers"] = self.watcher.get_subscriber_count()
         if self.gossip:
-            stats["gossip_members"] = len(self.gossip.get_alive_members())
+            all_instances = await self.registry.get_all_instances()
+            alive_members = self.gossip.get_alive_members()
+            stats["alive_members"] = len(alive_members)
+            stats["all_members"] = len(self.gossip.get_all_members())
+            stats["total_services"] = len(all_instances)
+            stats["total_instances"] = sum(len(v) for v in all_instances.values())
+            stats["member_id"] = self.gossip.member_id
+            stats["last_sync_times"] = self.gossip._last_sync_time
+            stats["sync_error_count"] = self.gossip._sync_error_count
+            stats["tombstones_count"] = len(self.registry.get_tombstones())
         return (200, {"Content-Type": "application/json"}, json.dumps(stats))
 
     async def _handle_update_status(self, query: dict, body: str) -> tuple:
@@ -299,3 +311,117 @@ class DiscoveryServer:
     async def _handle_protection_status(self, query: dict, body: str) -> tuple:
         stats = self.protection.get_stats()
         return (200, {"Content-Type": "application/json"}, json.dumps(stats))
+
+    async def _handle_query_instances(self, query: dict, body: str) -> tuple:
+        try:
+            service_name = query.get("service_name", [None])[0]
+            if not service_name:
+                return (400, {"Content-Type": "application/json"},
+                        json.dumps({"error": "service_name required"}))
+
+            instances = await self.query_service.get_service(service_name)
+
+            region = query.get("region", [None])[0]
+            if region:
+                instances = [i for i in instances if i.region == region]
+
+            zone = query.get("zone", [None])[0]
+            if zone:
+                instances = [i for i in instances if i.zone == zone]
+
+            status = query.get("status", [None])[0]
+            if status:
+                instances = [i for i in instances if i.status.value == status]
+
+            metadata_keys = [k for k in query.keys() if k.startswith("meta_")]
+            for meta_key in metadata_keys:
+                meta_name = meta_key[len("meta_"):]
+                meta_value = query[meta_key][0]
+                instances = [i for i in instances if i.metadata.get(meta_name) == meta_value]
+
+            instances.sort(key=lambda i: (i.host, i.port, i.instance_id))
+
+            result = [i.to_dict() for i in instances]
+            return (200, {"Content-Type": "application/json"}, json.dumps(result))
+        except Exception as e:
+            return (500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}))
+
+    async def _handle_cluster_status(self, query: dict, body: str) -> tuple:
+        try:
+            local_stats = await self.gossip.get_cluster_stats() if self.gossip else {}
+
+            members_stats = []
+            if self.gossip:
+                for member in self.gossip.get_alive_members():
+                    if member.member_id == self.gossip.member_id:
+                        members_stats.append(local_stats)
+                        continue
+                    try:
+                        remote_stats = await self._fetch_remote_status(member)
+                        if remote_stats:
+                            members_stats.append(remote_stats)
+                    except Exception:
+                        members_stats.append({
+                            "member_id": member.member_id,
+                            "host": member.host,
+                            "http_port": member.http_port,
+                            "gossip_port": member.port,
+                            "state": "UNREACHABLE",
+                            "error": "Failed to fetch status",
+                        })
+
+            has_local = any(s.get("member_id") == self.gossip.member_id for s in members_stats) if self.gossip else False
+            if self.gossip and not has_local:
+                members_stats.insert(0, local_stats)
+
+            total_services_list = [s.get("total_services", 0) for s in members_stats]
+            total_instances_list = [s.get("total_instances", 0) for s in members_stats]
+
+            consistent = (
+                len(set(total_services_list)) <= 1
+                and len(set(total_instances_list)) <= 1
+                and len(members_stats) == (await self.gossip.get_cluster_stats())["alive_members"]
+            ) if self.gossip else True
+
+            result = {
+                "consistent": consistent,
+                "total_members": len(members_stats),
+                "members": members_stats,
+            }
+
+            return (200, {"Content-Type": "application/json"}, json.dumps(result))
+        except Exception as e:
+            return (500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}))
+
+    async def _fetch_remote_status(self, member) -> Optional[dict]:
+        try:
+            http_port = member.http_port if hasattr(member, 'http_port') and member.http_port else member.port
+            reader, writer = await asyncio.open_connection(
+                member.host, http_port, limit=65536
+            )
+            request = (
+                f"GET /status HTTP/1.1\r\n"
+                f"Host: {member.host}:{http_port}\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            response = await reader.read(65536)
+            writer.close()
+            await writer.wait_closed()
+
+            response_text = response.decode("utf-8", errors="replace")
+            body_start = response_text.find("\r\n\r\n")
+            if body_start == -1:
+                return None
+            body = response_text[body_start + 4:]
+            data = json.loads(body)
+            data["member_id"] = member.member_id
+            data["host"] = member.host
+            data["http_port"] = http_port
+            data["gossip_port"] = member.port
+            return data
+        except Exception as e:
+            logger.error("Failed to fetch status from %s:%s: %s", member.host, member.port, e)
+            return None
