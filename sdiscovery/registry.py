@@ -68,16 +68,20 @@ class Registry:
         heartbeat_timeout: float = 30.0,
         eviction_interval: float = 10.0,
         eviction_threshold: float = 0.85,
+        tombstone_ttl: float = 3600.0,
     ):
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_timeout = heartbeat_timeout
         self.eviction_interval = eviction_interval
         self.eviction_threshold = eviction_threshold
+        self.tombstone_ttl = tombstone_ttl
 
         self._instances: dict[str, dict[str, Instance]] = {}
+        self._tombstones: dict[str, tuple[int, float]] = {}
         self._lock = asyncio.Lock()
         self._change_callbacks: list[OnChangeCallback] = []
         self._eviction_task: Optional[asyncio.Task] = None
+        self._tombstone_task: Optional[asyncio.Task] = None
         self._should_evict = True
 
         self._total_heartbeat_count = 0
@@ -101,14 +105,23 @@ class Registry:
                 self._instances[svc] = {}
 
             existing = self._instances[svc].get(instance.instance_id)
+            tombstone = self._tombstones.get(instance.instance_id)
+
             if existing:
-                instance.version = existing.version + 1
+                if instance.version <= existing.version:
+                    instance.version = existing.version + 1
                 instance.registration_time = existing.registration_time
+            elif tombstone:
+                if instance.version <= tombstone[0]:
+                    instance.version = tombstone[0] + 1
+                del self._tombstones[instance.instance_id]
+                self._expected_heartbeat_count += 1
+            else:
+                self._expected_heartbeat_count += 1
 
             instance.last_heartbeat = time.time()
             instance.last_dirty_time = time.time()
             self._instances[svc][instance.instance_id] = instance
-            self._expected_heartbeat_count += 1
 
         await self._notify_change("REGISTER", instance)
         return instance
@@ -117,12 +130,18 @@ class Registry:
         async with self._lock:
             svc_map = self._instances.get(service_name)
             if not svc_map or instance_id not in svc_map:
+                existing_tombstone = self._tombstones.get(instance_id)
+                if existing_tombstone:
+                    new_version = existing_tombstone[0] + 1
+                    self._tombstones[instance_id] = (new_version, time.time())
                 return False
             instance = svc_map.pop(instance_id)
+            tombstone_version = instance.version + 1
+            instance.version = tombstone_version
+            self._tombstones[instance_id] = (tombstone_version, time.time())
             self._expected_heartbeat_count = max(0, self._expected_heartbeat_count - 1)
             if not svc_map:
                 del self._instances[service_name]
-                self._expected_heartbeat_count = max(0, self._expected_heartbeat_count - 1)
 
         await self._notify_change("DEREGISTER", instance)
         return True
@@ -224,22 +243,88 @@ class Registry:
             self._eviction_task = None
 
     async def apply_delta(self, instances: list[dict], action: str = "REGISTER"):
-        for inst_data in instances:
-            inst = Instance.from_dict(inst_data)
-            if action == "REGISTER":
-                existing = self._instances.get(inst.service_name, {}).get(inst.instance_id)
-                if existing and existing.version >= inst.version:
-                    continue
-                if inst.service_name not in self._instances:
-                    self._instances[inst.service_name] = {}
-                self._instances[inst.service_name][inst.instance_id] = inst
-            elif action == "DEREGISTER":
-                svc_map = self._instances.get(inst.service_name)
-                if svc_map and inst.instance_id in svc_map:
-                    del svc_map[inst.instance_id]
+        async with self._lock:
+            for inst_data in instances:
+                inst = Instance.from_dict(inst_data)
+                inst_id = inst.instance_id
+                svc_name = inst.service_name
+
+                if action == "REGISTER":
+                    tombstone = self._tombstones.get(inst_id)
+                    if tombstone and tombstone[0] >= inst.version:
+                        continue
+
+                    existing = self._instances.get(svc_name, {}).get(inst_id)
+                    if existing and existing.version >= inst.version:
+                        continue
+
+                    if svc_name not in self._instances:
+                        self._instances[svc_name] = {}
+                    self._instances[svc_name][inst_id] = inst
+
+                    if tombstone:
+                        del self._tombstones[inst_id]
+
+                elif action == "DEREGISTER":
+                    tombstone = self._tombstones.get(inst_id)
+                    if tombstone and tombstone[0] >= inst.version:
+                        continue
+
+                    svc_map = self._instances.get(svc_name)
+                    if svc_map and inst_id in svc_map:
+                        del svc_map[inst_id]
+                        if not svc_map:
+                            del self._instances[svc_name]
+
+                    self._tombstones[inst_id] = (inst.version, time.time())
+
+    def get_tombstones(self) -> dict[str, int]:
+        return {iid: ver for iid, (ver, _) in self._tombstones.items()}
+
+    async def _cleanup_tombstones(self):
+        now = time.time()
+        async with self._lock:
+            expired = [
+                iid for iid, (_, ts) in self._tombstones.items()
+                if now - ts > self.tombstone_ttl
+            ]
+            for iid in expired:
+                del self._tombstones[iid]
+
+    async def _tombstone_cleanup_loop(self):
+        while self._should_evict:
+            try:
+                await self._cleanup_tombstones()
+            except Exception:
+                pass
+            await asyncio.sleep(max(self.tombstone_ttl / 4, 60.0))
+
+    async def start_eviction(self):
+        if self._eviction_task is None:
+            self._should_evict = True
+            self._eviction_task = asyncio.create_task(self._eviction_loop())
+            self._tombstone_task = asyncio.create_task(self._tombstone_cleanup_loop())
+
+    async def stop_eviction(self):
+        self._should_evict = False
+        for task_attr in ["_eviction_task", "_tombstone_task"]:
+            task = getattr(self, task_attr, None)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, task_attr, None)
 
     def get_snapshot(self) -> dict:
         result = {}
         for svc_name, svc_map in self._instances.items():
             result[svc_name] = [inst.to_dict() for inst in svc_map.values()]
         return result
+
+    def get_full_state(self) -> dict:
+        return {
+            "snapshot": self.get_snapshot(),
+            "tombstones": {iid: {"version": ver, "timestamp": ts} for iid, (ver, ts) in self._tombstones.items()},
+        }

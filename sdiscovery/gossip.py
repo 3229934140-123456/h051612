@@ -141,16 +141,18 @@ class GossipProtocol:
         try:
             sync_data = await self._send_sync(host, port)
             if sync_data:
-                await self._apply_sync(sync_data)
+                logger.info("Join successful, sync_data keys: %s", list(sync_data.keys()))
+                member_id = sync_data.get("sender_id", "")
                 member = GossipMember(
-                    member_id=sync_data.get("sender_id", uuid.uuid4().hex[:12]),
+                    member_id=member_id,
                     host=host,
                     port=port,
                     state=MemberState.ALIVE,
                 )
-                self._members[member.member_id] = member
+                if member_id and member_id != self.member_id:
+                    self._members[member.member_id] = member
                 await self._notify_member_change(member, "JOIN")
-                logger.info("Joined cluster via %s:%d", host, port)
+                logger.info("Joined cluster via %s:%d, members: %d", host, port, len(self._members))
                 return True
         except Exception as e:
             logger.error("Failed to join %s:%d: %s", host, port, e)
@@ -169,16 +171,20 @@ class GossipProtocol:
         await self.stop()
 
     async def _send_sync(self, host: str, port: int) -> Optional[dict]:
+        full_state = self.registry.get_full_state()
         msg = GossipMessage(
             msg_type=MessageType.SYNC,
             sender_id=self.member_id,
             data={
-                "snapshot": self.registry.get_snapshot(),
+                "snapshot": full_state["snapshot"],
+                "tombstones": full_state.get("tombstones", {}),
                 "members": {mid: m.to_dict() for mid, m in self._members.items()},
             },
         )
         try:
             response = await self._send_and_receive(host, port, msg)
+            if response:
+                await self._apply_sync(response)
             return response
         except Exception:
             return None
@@ -186,11 +192,11 @@ class GossipProtocol:
     async def _apply_sync(self, sync_data: dict):
         snapshot = sync_data.get("snapshot", {})
         for svc_name, instances_data in snapshot.items():
-            instances = [Instance.from_dict(d) for d in instances_data]
-            for inst in instances:
-                existing = await self.registry.get_instance(inst.service_name, inst.instance_id)
-                if not existing or existing.version < inst.version:
-                    await self.registry.register(inst)
+            await self.registry.apply_delta(instances_data, action="REGISTER")
+
+        tombstones_data = sync_data.get("tombstones", {})
+        if tombstones_data:
+            await self._apply_tombstones(tombstones_data, snapshot)
 
         members_data = sync_data.get("members", {})
         for mid, mdata in members_data.items():
@@ -200,6 +206,38 @@ class GossipProtocol:
             new_member = GossipMember.from_dict(mdata)
             if not existing or existing.incarnation < new_member.incarnation:
                 self._members[mid] = new_member
+
+    async def _apply_tombstones(self, tombstones: dict, snapshot: dict):
+        snapshot_instance_ids = set()
+        for svc_instances in snapshot.values():
+            for inst_data in svc_instances:
+                snapshot_instance_ids.add(inst_data.get("instance_id", ""))
+
+        for iid, tomb_data in tombstones.items():
+            version = tomb_data.get("version", 0) if isinstance(tomb_data, dict) else tomb_data
+            if iid in snapshot_instance_ids:
+                continue
+
+            async with self.registry._lock:
+                existing_tomb = self.registry._tombstones.get(iid)
+                if existing_tomb and existing_tomb[0] >= version:
+                    continue
+
+                found = None
+                found_svc = None
+                for svc_name, svc_map in self.registry._instances.items():
+                    if iid in svc_map:
+                        found = svc_map[iid]
+                        found_svc = svc_name
+                        break
+
+                if found and found.version < version:
+                    del self.registry._instances[found_svc][iid]
+                    if not self.registry._instances[found_svc]:
+                        del self.registry._instances[found_svc]
+
+                if not existing_tomb or existing_tomb[0] < version:
+                    self.registry._tombstones[iid] = (version, time.time())
 
     async def _send_and_receive(
         self, host: str, port: int, msg: GossipMessage, timeout: float = 5.0
@@ -413,11 +451,19 @@ class GossipProtocol:
 
             elif msg_type == MessageType.SYNC:
                 sync_data = payload
-                if "snapshot" in sync_data:
+                action = sync_data.get("action")
+
+                if action == "DEREGISTER":
+                    snapshot = sync_data.get("snapshot", {})
+                    for svc_name, instances_data in snapshot.items():
+                        await self.registry.apply_delta(instances_data, action="DEREGISTER")
+                elif "snapshot" in sync_data:
                     await self._apply_sync(sync_data)
 
+                full_state = self.registry.get_full_state()
                 response_data = {
-                    "snapshot": self.registry.get_snapshot(),
+                    "snapshot": full_state["snapshot"],
+                    "tombstones": full_state.get("tombstones", {}),
                     "members": {mid: m.to_dict() for mid, m in self._members.items()},
                     "sender_id": self.member_id,
                 }
@@ -426,7 +472,7 @@ class GossipProtocol:
                     response = json.dumps({
                         "msg_type": MessageType.ACK.value,
                         "sender_id": self.member_id,
-                        "data": response_data,
+                        "data": {"original_msg_id": msg_id, **response_data},
                         "msg_id": uuid.uuid4().hex[:8],
                         "timestamp": time.time(),
                     }).encode()
